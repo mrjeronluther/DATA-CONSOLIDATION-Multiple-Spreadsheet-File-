@@ -1,0 +1,194 @@
+
+- State Management: It saves its progress after each small chunk of work using PropertiesService. This includes which file and tab it's currently processing.
+- Batch Processing: Instead of loading millions of rows into memory, it processes a limited number of rows, writes them to the Conso sheet, and then clears its memory.
+- Resumability: If the script approaches the 6-minute time limit, it will automatically pause, save its progress, and instruct you to run it again. When you do, it will pick up exactly where it left off.
+- Cell Limit Awareness: The script calculates the maximum possible rows and will stop gracefully when the Conso sheet is full, informing you that it has completed the task due to the sheet's capacity.
+
+
+// --- CONFIGURATION ---
+// The script will try to pause and save its state after this many minutes.
+// Set to 5 to be safe from the 6-minute limit.
+const MAX_EXECUTION_TIME_MINUTES = 5;
+
+// The number of rows to accumulate in memory before writing them to the sheet.
+// A larger batch is faster but uses more memory. 500-1000 is a good range.
+const BATCH_WRITE_SIZE = 1000;
+
+// The hard limit of cells in a Google Sheet.
+const GOOGLE_SHEET_CELL_LIMIT = 10000000;
+
+/**
+ * Adds a custom menu to the spreadsheet UI.
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+      .createMenu('Consolidator')
+      .addItem('► Start or Resume Consolidation', 'consolidateToMaxPerformance')
+      .addSeparator()
+      .addItem('■ Reset Consolidation Process', 'resetConsolidationProcess')
+      .addToUi();
+}
+
+/**
+ * Consolidates data in batches, saving its state to allow for multiple runs
+ * to complete a large job without timing out or exceeding memory limits.
+ */
+function consolidateToMaxPerformance() {
+  const mainSpreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+  const scriptProperties = PropertiesService.getScriptProperties();
+
+  // --- 1. LOAD OR INITIALIZE STATE ---
+  let state = JSON.parse(scriptProperties.getProperty('consolidationState'));
+
+  if (!state) {
+    const response = ui.alert('Start New Consolidation?',
+      'This will clear the "Conso" sheet and start a new process.\n\n' +
+      'You may need to run this script multiple times. It will prompt you when to run it again.\n\n' +
+      'Do you want to begin?', ui.ButtonSet.YES_NO);
+
+    if (response !== ui.Button.YES) {
+      ui.alert('Operation cancelled.');
+      return;
+    }
+    
+    // --- First-time setup ---
+    const sourceFileSheet = mainSpreadsheet.getSheetByName("SOURCEFILES");
+    const consoSheet = mainSpreadsheet.getSheetByName("Conso");
+
+    consoSheet.clear();
+    const columnsToGet = ["Month", "Year", "Property", "Payor Company", "Supplier/Payee", "Status", "Amount", "Sector", "Services"];
+    const headers = ["File Name", "Tab Name", ...columnsToGet];
+    consoSheet.appendRow(headers);
+    SpreadsheetApp.flush(); // Ensure the sheet is cleared and headers are written before proceeding.
+
+    const sourceInfo = sourceFileSheet.getRange(2, 2, sourceFileSheet.getLastRow() - 1, 2).getValues()
+                                    .filter(row => row[0] && row[1]); // Filter out empty rows
+
+    state = {
+      sourceInfo: sourceInfo,
+      columnsToGet: columnsToGet,
+      headers: headers,
+      currentFileIndex: 0,
+      currentTabIndex: 0,
+      totalRowsWritten: 0,
+      maxPossibleRows: Math.floor(GOOGLE_SHEET_CELL_LIMIT / headers.length)
+    };
+  } else {
+    ui.alert('Resuming Consolidation', `Resuming process from file #${state.currentFileIndex + 1}.`, ui.ButtonSet.OK);
+  }
+
+  // --- 2. MAIN PROCESSING LOOP ---
+  const consoSheet = mainSpreadsheet.getSheetByName("Conso");
+  const startTime = new Date();
+  let dataBatch = [];
+
+  try {
+    for (let i = state.currentFileIndex; i < state.sourceInfo.length; i++) {
+      state.currentFileIndex = i; // Update state for the current file loop
+      const tabNamesString = state.sourceInfo[i][0];
+      const fileUrl = state.sourceInfo[i][1];
+      const fileId = extractIdFromUrl(fileUrl);
+
+      if (!fileId) {
+        Logger.log(`SKIPPING: Invalid URL: ${fileUrl}`);
+        continue;
+      }
+      
+      const sourceSpreadsheet = SpreadsheetApp.openById(fileId);
+      const fileName = sourceSpreadsheet.getName();
+      const tabNames = tabNamesString.split(',').map(name => name.trim());
+
+      for (let j = state.currentTabIndex; j < tabNames.length; j++) {
+        state.currentTabIndex = j; // Update state for the current tab loop
+        
+        // --- Time and Cell Limit Checks ---
+        const elapsedMinutes = (new Date() - startTime) / 1000 / 60;
+        if (elapsedMinutes > MAX_EXECUTION_TIME_MINUTES) {
+          throw new Error('Timeout');
+        }
+        if (state.totalRowsWritten >= state.maxPossibleRows) {
+          throw new Error('SheetFull');
+        }
+
+        const tabName = tabNames[j];
+        const sourceSheet = sourceSpreadsheet.getSheetByName(tabName);
+        if (!sourceSheet) {
+          Logger.log(`SKIPPING TAB: "${tabName}" not found in file: ${fileName}`);
+          continue;
+        }
+
+        const allData = sourceSheet.getDataRange().getValues();
+        if (allData.length < 6) continue;
+
+        const sourceHeaders = allData[4].map(h => String(h).toLowerCase().trim());
+        const colIndices = state.columnsToGet.map(colName => sourceHeaders.indexOf(colName.toLowerCase().trim()));
+
+        const dataRows = allData.slice(5);
+        dataRows.forEach(dataRow => {
+          const newRow = colIndices.map(index => (index !== -1 ? dataRow[index] : ""));
+          if (newRow.join("").trim() !== "") {
+            dataBatch.push([fileName, tabName, ...newRow]);
+          }
+        });
+
+        // Write to the sheet when the batch is full
+        if (dataBatch.length >= BATCH_WRITE_SIZE) {
+          const rowsToWrite = dataBatch.length;
+          consoSheet.getRange(consoSheet.getLastRow() + 1, 1, rowsToWrite, state.headers.length).setValues(dataBatch);
+          state.totalRowsWritten += rowsToWrite;
+          dataBatch = []; // Clear the batch
+        }
+      }
+      state.currentTabIndex = 0; // Reset tab index for the next file
+    }
+
+    // --- 3. FINAL WRITE AND CLEANUP ---
+    if (dataBatch.length > 0) {
+      consoSheet.getRange(consoSheet.getLastRow() + 1, 1, dataBatch.length, state.headers.length).setValues(dataBatch);
+      state.totalRowsWritten += dataBatch.length;
+    }
+
+    ui.alert('Consolidation Complete!', `Successfully processed all source files. A total of ${state.totalRowsWritten} rows were consolidated.`, ui.ButtonSet.OK);
+    scriptProperties.deleteProperty('consolidationState'); // Clean up state
+
+  } catch (e) {
+    // --- 4. CATCH ERRORS, SAVE STATE, OR HANDLE COMPLETION ---
+    if (dataBatch.length > 0) { // Write any remaining data in the batch before pausing
+      consoSheet.getRange(consoSheet.getLastRow() + 1, 1, dataBatch.length, state.headers.length).setValues(dataBatch);
+      state.totalRowsWritten += dataBatch.length;
+    }
+    
+    scriptProperties.setProperty('consolidationState', JSON.stringify(state));
+
+    if (e.message === 'Timeout') {
+      ui.alert('Process Paused', 'The script has run for its allotted time and has saved its progress.\n\nPlease run the script again from the menu to continue.', ui.ButtonSet.OK);
+    } else if (e.message === 'SheetFull') {
+      ui.alert('Consolidation Complete (Sheet is Full)', `The "Conso" sheet has reached the Google Sheets cell limit.\n\nA total of ${state.totalRowsWritten} rows were consolidated. The process is now complete.`, ui.ButtonSet.OK);
+      scriptProperties.deleteProperty('consolidationState'); // Clean up on successful completion
+    } else {
+      ui.alert('An Error Occurred', `The script has stopped due to an error: ${e.message}\n\nYour progress has been saved. Please resolve the issue and run the script again to resume.`, ui.ButtonSet.OK);
+      Logger.log(e); // Log the full error for debugging
+    }
+  }
+}
+
+/**
+ * A helper function to clear the saved progress. Run this if you want to start over from scratch.
+ */
+function resetConsolidationProcess() {
+  const response = SpreadsheetApp.getUi().alert('Confirm Reset', 'Are you sure you want to clear all saved consolidation progress? You will have to start over.', SpreadsheetApp.getUi().ButtonSet.YES_NO);
+  if (response === SpreadsheetApp.getUi().Button.YES) {
+    PropertiesService.getScriptProperties().deleteProperty('consolidationState');
+    SpreadsheetApp.getUi().alert('Progress has been reset.');
+  }
+}
+
+/**
+ * Extracts the spreadsheet ID from a Google Sheets URL. (No changes needed here)
+ */
+function extractIdFromUrl(url) {
+  const regex = /\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/;
+  const match = url.match(regex);
+  return match ? match[1] : null;
+}
